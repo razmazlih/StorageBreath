@@ -225,18 +225,13 @@ struct ScanActivityPanel: View {
                     Text("\(max(0, Int(context.date.timeIntervalSince(startedAt)))) שניות").font(.caption).monospacedDigit().foregroundStyle(.secondary)
                 }
             }
-            if let fraction = progress.directoryFraction, let percent = progress.directoryPercent, let done = progress.completedDirectories, let discovered = progress.discoveredDirectories {
-                ResponsiveRow {
-                    Text("אומדן התקדמות: \(percent)%").font(.headline).monospacedDigit()
-                    Spacer()
-                    Text("\(done.formatted()) מתוך \(discovered.formatted()) תיקיות שהתגלו").font(.caption).foregroundStyle(.secondary)
-                }
-                ProgressView(value:fraction,total:1).tint(Palette.accent)
-                Text("האומדן מתייחס לתיקיות שהתגלו בהיקף שבחרת, ועשוי להשתנות עם גילוי תיקיות נוספות. דילוגים מפורטים בדוח הכיסוי.").font(.caption2).foregroundStyle(.secondary)
-            } else {
-                ProgressView().progressViewStyle(.linear).tint(Palette.accent)
-                Text("מגלה תיקיות לחישוב אומדן…").font(.caption2).foregroundStyle(.secondary)
+            ProgressView().progressViewStyle(.linear).tint(Palette.accent)
+            if let done = progress.completedDirectories, let discovered = progress.discoveredDirectories {
+                Text("\(done.formatted()) תיקיות טופלו · \(max(0, discovered-done).formatted()) ממתינות כרגע")
+                    .font(.caption).monospacedDigit().foregroundStyle(.secondary)
             }
+            Text("מגלים וסורקים במקביל. ההיקף הכולל עדיין אינו ידוע, לכן לא מוצג אחוז משוער.")
+                .font(.caption2).foregroundStyle(.secondary)
             ResponsiveRow {
                 Text("\(progress.inspected.formatted()) פריטים נבדקו")
                 Spacer()

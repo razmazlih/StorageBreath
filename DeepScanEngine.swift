@@ -455,31 +455,22 @@ final class DeepScanEngine {
                 localIssues.reserveCapacity(64)
                 var pendingJobs: [InventoryJob] = []
                 pendingJobs.reserveCapacity(64)
-                func flushJobs() {
-                    guard !pendingJobs.isEmpty else { return }
+                func flush(completing directory: String? = nil) {
+                    guard !pendingJobs.isEmpty || !localIssues.isEmpty || !entries.isEmpty || directory != nil else { return }
+                    let addedJobs = !pendingJobs.isEmpty
                     do {
-                        try database.enqueue(pendingJobs)
-                        pendingJobs.removeAll(keepingCapacity:true)
-                        state.condition.lock(); state.condition.broadcast(); state.condition.unlock()
-                    } catch { fail(pendingJobs.first?.directory.path ?? "",error) }
-                }
-                func flushIssues() {
-                    guard !localIssues.isEmpty else { return }
-                    do { try database.addIssues(localIssues); localIssues.removeAll(keepingCapacity: true) }
-                    catch { fail(localIssues.first?.path ?? "", error); localIssues.removeAll(keepingCapacity: true) }
+                        try database.persistScanBatch(entries: entries, issues: localIssues, jobs: pendingJobs, completing: directory)
+                        pendingJobs.removeAll(keepingCapacity: true)
+                        localIssues.removeAll(keepingCapacity: true)
+                        entries.removeAll(keepingCapacity: true)
+                        if addedJobs {
+                            state.condition.lock(); state.condition.broadcast(); state.condition.unlock()
+                        }
+                    } catch { fail(directory ?? entries.first?.0.path ?? pendingJobs.first?.directory.path ?? "", error) }
                 }
                 func workerIssue(_ url: URL, _ reason: String) {
                     localIssues.append(DeepIssue(path: url.path, reason: reason))
-                    if localIssues.count >= 64 { flushIssues() }
-                }
-                func flush() {
-                    // Children are durable before their parent can be retired,
-                    // including cancellation replay of an unfinished directory.
-                    flushJobs()
-                    flushIssues()
-                    guard !entries.isEmpty else { return }
-                    do { try database.insertBatch(entries); entries.removeAll(keepingCapacity: true) }
-                    catch { fail(entries.first?.0.path ?? "", error); entries.removeAll(keepingCapacity: true) }
+                    if localIssues.count >= 64 { flush() }
                 }
                 func record(_ url: URL, root: URL) -> Bool {
                     if excluded.contains(where: { self.inside(url.path, $0) }) {
@@ -551,7 +542,7 @@ final class DeepScanEngine {
                                         guard let child = walk.nextObject() as? URL else { return false }
                                         if record(child, root: task.root) {
                                             pendingJobs.append(InventoryJob(directory:child,root:task.root,recordFirst:false))
-                                            if pendingJobs.count >= 64 { flushJobs() }
+                                            if pendingJobs.count >= 64 { flush() }
                                         }
                                         return true
                                     }
@@ -560,13 +551,10 @@ final class DeepScanEngine {
                             } else { enumerationFailed = true }
                             if enumerationFailed { workerIssue(task.directory, "לא ניתן להשלים את קריאת התיקייה") }
                         }
-                        flush()
-                        // Persist children and file rows before retiring their
-                        // parent job. Cancel/crash leaves it replayable on resume.
-                        if !self.cancelled {
-                            do { try database.finishJob(task.directory.path) }
-                            catch { fail(task.directory.path, error) }
-                        }
+                        // Commit remaining children, rows, coverage and parent
+                        // completion together. Cancellation leaves the parent active
+                        // and therefore replayable after resume or a crash.
+                        flush(completing: self.cancelled ? nil : task.directory.path)
                     }
                     state.condition.lock(); state.active -= 1; state.condition.broadcast(); state.condition.unlock()
                 }

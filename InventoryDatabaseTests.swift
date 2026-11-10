@@ -15,6 +15,35 @@ import SQLite3
             let path = folder.appendingPathComponent(n == 1 ? ".קובץ-מוסתר.txt" : "report-\(n).txt").path
             return DeepFile(id:path,path:path,title:URL(fileURLWithPath:path).lastPathComponent,category:n.isMultiple(of:2) ? "קבצים זמניים" : "מסמכים",bytes:Int64(n),modified:date.addingTimeInterval(Double(n)),isTemporary:n.isMultiple(of:2),reason:"fixture metadata",canTrash:!n.isMultiple(of:5))
         }
+        // Worker batches publish file rows, coverage and child jobs atomically
+        // with their parent completion, including when a write fails mid-batch.
+        let batchURL = root.appendingPathComponent("batch.sqlite")
+        let batchDB = try InventoryDatabase(url: batchURL)
+        _ = try batchDB.beginScan(roots: [folder], resume: false)
+        _ = try batchDB.claimNextJob()
+        let batchChild = InventoryJob(directory: folder.appendingPathComponent("child"), root: folder, recordFirst: false)
+        let batchIssue = DeepIssue(path: folder.path, reason: "fixture coverage")
+        var batchHandle: OpaquePointer?
+        precondition(sqlite3_open_v2(batchURL.path, &batchHandle, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK)
+        defer { sqlite3_close(batchHandle) }
+        precondition(sqlite3_exec(batchHandle, "CREATE TRIGGER fail_fixture BEFORE INSERT ON files BEGIN SELECT RAISE(ABORT,'fixture failure'); END", nil, nil, nil) == SQLITE_OK)
+        do {
+            try batchDB.persistScanBatch(entries: [(item(1), nil)], issues: [batchIssue], jobs: [batchChild], completing: folder.path)
+            preconditionFailure("batch should roll back")
+        } catch {}
+        try check(try batchDB.stats().count == 0)
+        try check(try batchDB.issueCount() == 0)
+        let rolledBack = try batchDB.directoryProgress()
+        precondition(rolledBack.completed == 0 && rolledBack.discovered == 1)
+        precondition(sqlite3_exec(batchHandle, "DROP TRIGGER fail_fixture", nil, nil, nil) == SQLITE_OK)
+        try check(try batchDB.query(request: InventoryQuery()).total == 0)
+        try batchDB.persistScanBatch(entries: [(item(1), nil)], issues: [batchIssue], jobs: [batchChild], completing: folder.path)
+        try check(try batchDB.query(request: InventoryQuery()).total == 1)
+        try check(try batchDB.issueCount() == 1)
+        let committed = try batchDB.directoryProgress()
+        precondition(committed.completed == 1 && committed.discovered == 2)
+        try check(try batchDB.claimNextJob()?.directory.path == batchChild.directory.path)
+
         for start in stride(from:0,to:20000,by:256) {
             let rows = (start..<min(start+256,20000)).map { index -> (DeepFile,InventorySnapshot?) in
                 let file = item(index)

@@ -190,27 +190,43 @@ final class InventoryDatabase: @unchecked Sendable {
     func insert(file: DeepFile, snapshot: InventorySnapshot?) throws { try insertBatch([(file,snapshot)]) }
     func insertBatch(_ entries: [(DeepFile, InventorySnapshot?)]) throws {
         guard !entries.isEmpty else { return }
-        try transaction(inventoryChanged:true) {
-            let statement = try Self.prepare(writer,"INSERT OR REPLACE INTO files(path,id,title,category,bytes,modified,temporary,reason,can_trash,identity,logical_size,snapshot_modified,snapshot_allowed,root) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-            defer { sqlite3_finalize(statement) }
-            for (file,snapshot) in entries {
-                sqlite3_reset(statement); sqlite3_clear_bindings(statement)
-                var values: [Value] = [.text(file.path),.text(file.id),.text(file.title),.text(file.category),.integer(max(0,file.bytes)),.real(file.modified.timeIntervalSinceReferenceDate),.integer(file.isTemporary ? 1:0),.text(file.reason),.integer(file.canTrash ? 1:0)]
-                if let snapshot { values += [.text(snapshot.identity),.integer(Int64(snapshot.logicalSize)),.real(snapshot.modified.timeIntervalSinceReferenceDate),.integer(snapshot.allowed ? 1:0),.text(snapshot.root.path)] }
-                else { values += Array(repeating:.null,count:5) }
-                try Self.bind(values,to:statement,db:writer); try Self.done(statement,db:writer)
-            }
+        try transaction(inventoryChanged:true) { try insertBatchLocked(entries) }
+    }
+    private func insertBatchLocked(_ entries: [(DeepFile, InventorySnapshot?)]) throws {
+        guard !entries.isEmpty else { return }
+        let statement = try Self.prepare(writer,"INSERT OR REPLACE INTO files(path,id,title,category,bytes,modified,temporary,reason,can_trash,identity,logical_size,snapshot_modified,snapshot_allowed,root) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        defer { sqlite3_finalize(statement) }
+        for (file,snapshot) in entries {
+            sqlite3_reset(statement); sqlite3_clear_bindings(statement)
+            var values: [Value] = [.text(file.path),.text(file.id),.text(file.title),.text(file.category),.integer(max(0,file.bytes)),.real(file.modified.timeIntervalSinceReferenceDate),.integer(file.isTemporary ? 1:0),.text(file.reason),.integer(file.canTrash ? 1:0)]
+            if let snapshot { values += [.text(snapshot.identity),.integer(Int64(snapshot.logicalSize)),.real(snapshot.modified.timeIntervalSinceReferenceDate),.integer(snapshot.allowed ? 1:0),.text(snapshot.root.path)] }
+            else { values += Array(repeating:.null,count:5) }
+            try Self.bind(values,to:statement,db:writer); try Self.done(statement,db:writer)
         }
     }
     func addIssues(_ issues: [DeepIssue]) throws {
         guard !issues.isEmpty else { return }
-        try transaction {
-            let statement = try Self.prepare(writer,"INSERT OR IGNORE INTO issues(path,reason) VALUES(?,?)")
-            defer { sqlite3_finalize(statement) }
-            for issue in issues {
-                sqlite3_reset(statement); sqlite3_clear_bindings(statement)
-                try Self.bind([.text(issue.path),.text(issue.reason)],to:statement,db:writer); try Self.done(statement,db:writer)
-            }
+        try transaction { try addIssuesLocked(issues) }
+    }
+    private func addIssuesLocked(_ issues: [DeepIssue]) throws {
+        guard !issues.isEmpty else { return }
+        let statement = try Self.prepare(writer,"INSERT OR IGNORE INTO issues(path,reason) VALUES(?,?)")
+        defer { sqlite3_finalize(statement) }
+        for issue in issues {
+            sqlite3_reset(statement); sqlite3_clear_bindings(statement)
+            try Self.bind([.text(issue.path),.text(issue.reason)],to:statement,db:writer); try Self.done(statement,db:writer)
+        }
+    }
+    /// One durable commit for a bounded worker batch. A completed directory can
+    /// never become visible without its file rows, coverage issues and child jobs.
+    /// Combining these writes avoids up to four serialized WAL commits per folder.
+    func persistScanBatch(entries: [(DeepFile, InventorySnapshot?)], issues: [DeepIssue], jobs: [InventoryJob], completing directory: String? = nil) throws {
+        guard !entries.isEmpty || !issues.isEmpty || !jobs.isEmpty || directory != nil else { return }
+        try transaction(inventoryChanged: !entries.isEmpty) {
+            if !jobs.isEmpty { try enqueueLocked(jobs) }
+            try addIssuesLocked(issues)
+            try insertBatchLocked(entries)
+            if let directory { try finishJobLocked(directory) }
         }
     }
     func stats() throws -> InventoryStats {
@@ -516,11 +532,10 @@ final class InventoryDatabase: @unchecked Sendable {
             defer { sqlite3_finalize(statement) }; try Self.bind([.text(path)],to:statement,db:writer); try Self.done(statement,db:writer)
         }
     }
-    func finishJob(_ path: String) throws {
-        try transaction {
-            let statement = try Self.prepare(writer,"UPDATE jobs SET state=2 WHERE directory=?")
-            defer { sqlite3_finalize(statement) }; try Self.bind([.text(path)],to:statement,db:writer); try Self.done(statement,db:writer)
-        }
+    func finishJob(_ path: String) throws { try transaction { try finishJobLocked(path) } }
+    private func finishJobLocked(_ path: String) throws {
+        let statement = try Self.prepare(writer,"UPDATE jobs SET state=2 WHERE directory=?")
+        defer { sqlite3_finalize(statement) }; try Self.bind([.text(path)],to:statement,db:writer); try Self.done(statement,db:writer)
     }
     // Keep queue ordering aligned with jobs_pending(state,directory). Ordering
     // by rowid forces SQLite to sort every pending directory for every claim.

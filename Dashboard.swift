@@ -32,7 +32,7 @@ extension DeepFile {
     @Published var ai = false
     @Published var aiCandidates: [AICandidate] = []
     @Published var preparingAI = false
-    @Published var performance: ScanPerformance = .background
+    @Published var performance: ScanPerformance = .balanced
     @Published var lastWorkers = 0
     @Published var scanElapsed: TimeInterval = 0
     @Published private(set) var loadingIndex = false
@@ -371,6 +371,14 @@ struct DashboardView: View {
             if model.cloud { CloudView().frame(maxWidth: .infinity).transition(.opacity) } else {
                 VStack(spacing: 0) {
                     fixedToolbar
+                    if model.scanning {
+                        HStack(spacing: 10) {
+                            if !model.paused { ProgressView().controlSize(.small) }
+                            Text(model.paused ? "הסריקה מושהית" : "סורק · \(model.progress.inspected.formatted()) פריטים נבדקו")
+                            Spacer()
+                            Text("\(model.progress.found.formatted()) קבצים · \(size(model.progress.bytes))")
+                        }.font(.caption).monospacedDigit().padding(.horizontal, 20).padding(.vertical, 8)
+                    }
                     ScrollView(.vertical) { VStack(spacing: 18) {
                         if !model.completed && !model.scanning && !model.loadingIndex { welcomeCard }
                         if model.completed { coverageBanner }
@@ -751,8 +759,10 @@ struct DashboardView: View {
         ResponsiveRow {
             Image(systemName: model.cancelled ? "pause.circle" : "checkmark.circle.fill").foregroundStyle(model.cancelled ? .orange : Palette.accent)
             Text(model.cancelled ? "הסריקה נעצרה · התוצאות שנאספו נשמרו" : "המעבר על ההיקף הנגיש הסתיים").font(.caption)
-            if let percent = model.progress.directoryPercent {
-                Text("\(percent)% מהתיקיות שהתגלו").font(.caption).monospacedDigit().help("אומדן לפי תיקיות שהתגלו בהיקף שנבחר, כולל תיקיות שדולגו; אינו אחוז מכל הקבצים או נפח המחשב.")
+            if !model.cancelled {
+                Text("100% מהמעבר הושלם").font(.caption).monospacedDigit()
+            } else if let done = model.progress.completedDirectories {
+                Text("\(done.formatted()) תיקיות טופלו").font(.caption).monospacedDigit()
             }
             Spacer()
             Button("דוח כיסוי · \(model.issueTotal) דילוגים") { model.loadIssues() }.font(.caption).buttonStyle(.borderless)
