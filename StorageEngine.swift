@@ -38,17 +38,25 @@ struct ScanReport {
 final class StorageEngine {
     private let fm = FileManager.default
     private let lock = NSLock()
-    private var approved: [String: Date] = [:]
+    private struct CleanupSnapshot {
+        let modified: Date
+        let identity: String
+    }
+    private var approved: [String: CleanupSnapshot] = [:]
+    private func identity(_ info: URLResourceValues) -> String? {
+        guard let file = info.fileResourceIdentifier, let volume = info.volumeIdentifier else { return nil }
+        return String(describing: volume) + ":" + String(describing: file)
+    }
     private let temporaryRoot: URL
     init(temporaryRoot: URL = FileManager.default.temporaryDirectory) {
         self.temporaryRoot = temporaryRoot.resolvingSymlinksInPath().standardizedFileURL
     }
     private var scanHome = URL(fileURLWithPath: NSHomeDirectory())
-    private let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey, .isPackageKey, .isUbiquitousItemKey, .fileAllocatedSizeKey, .totalFileAllocatedSizeKey, .contentModificationDateKey, .creationDateKey, .contentAccessDateKey]
+    private let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey, .isPackageKey, .isUbiquitousItemKey, .fileAllocatedSizeKey, .totalFileAllocatedSizeKey, .contentModificationDateKey, .creationDateKey, .contentAccessDateKey, .fileResourceIdentifierKey, .volumeIdentifierKey]
 
     func scan(home: URL = FileManager.default.homeDirectoryForCurrentUser, progress: ((String) -> Void)? = nil, details: ((ScanProgress) -> Void)? = nil) -> ScanReport {
         var items: [ScanItem] = []
-        var snapshots: [String: Date] = [:]
+        var snapshots: [String: CleanupSnapshot] = [:]
         var skipped = 0
         var inspected = 0
         var limited = false
@@ -95,10 +103,10 @@ final class StorageEngine {
         }
         func add(_ url: URL, category: String, risk: CleanupRisk, minimum: Int64) {
             guard !containsSymlink(url, home: root), let info = metadata(url), info.isSymbolicLink != true, info.isUbiquitousItem != true else { return }
-            guard let bytes = size(url), bytes >= minimum, let modified = info.contentModificationDate else { return }
+            guard let bytes = size(url), bytes >= minimum, let modified = info.contentModificationDate, let fileIdentity = identity(info) else { return }
             let path = url.standardizedFileURL.path
             items.append(ScanItem(id: path, path: path, title: url.lastPathComponent, category: category, bytes: bytes, risk: risk))
-            snapshots[path] = modified
+            snapshots[path] = CleanupSnapshot(modified: modified, identity: fileIdentity)
             candidateBytes += bytes
         }
         // Only regenerable build output is considered a low-risk candidate. Caches may
@@ -156,9 +164,10 @@ final class StorageEngine {
                       let info = metadata(child), let modified = info.contentModificationDate,
                       modified <= cutoff else { continue }
                 guard let bytes = oldTemporarySize(child, cutoff: cutoff, maxEntries: 18_000 - (inspected - categoryInspected), deadline: min(start.addingTimeInterval(75), categoryStart.addingTimeInterval(8)), counted: { inspected += $0; emit(child.path) }), bytes >= 1_024 * 1_024 else { skipped += 1; _ = exhausted(); continue }
+                guard let fileIdentity = identity(info) else { continue }
                 let path = child.standardizedFileURL.path
                 items.append(ScanItem(id: path, path: path, title: child.lastPathComponent, category: "קבצים זמניים ישנים", bytes: bytes, risk: .review))
-                snapshots[path] = modified
+                snapshots[path] = CleanupSnapshot(modified: modified, identity: fileIdentity)
                 candidateBytes += bytes
             }
         } else { skipped += 1 }
@@ -219,9 +228,10 @@ final class StorageEngine {
             let url = URL(fileURLWithPath: item.path).standardizedFileURL
             guard url.path == item.path, snapshot[item.path] != nil,
                   (!containsSymlink(url, home: home) || !containsSymlink(url, home: temporaryRoot)),
-                  let info = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isUbiquitousItemKey]),
+                  let info = try? url.resourceValues(forKeys: keys),
                   info.isUbiquitousItem != true,
-                  info.contentModificationDate == snapshot[item.path] else {
+                  info.contentModificationDate == snapshot[item.path]?.modified,
+                  identity(info) == snapshot[item.path]?.identity else {
                 errors.append("\(item.title): השתנה מאז הסריקה או שאינו מותר לניקוי. יש לסרוק מחדש.")
                 continue
             }
@@ -237,7 +247,16 @@ final class StorageEngine {
                 errors.append("\(url.lastPathComponent): מוגן מניקוי.")
                 return false
             }
-            if url.path.hasPrefix(temporaryRoot.path + "/") && oldTemporarySize(url, cutoff: Date().addingTimeInterval(-7 * 24 * 60 * 60), maxEntries: 18_000, deadline: Date().addingTimeInterval(8)) == nil {
+            let freshURL = URL(fileURLWithPath: url.path)
+            guard (!containsSymlink(freshURL, home: home) || !containsSymlink(freshURL, home: temporaryRoot)),
+                  let info = try? freshURL.resourceValues(forKeys: keys),
+                  info.isUbiquitousItem != true,
+                  info.contentModificationDate == snapshot[url.path]?.modified,
+                  identity(info) == snapshot[url.path]?.identity else {
+                errors.append("\(url.lastPathComponent): השתנה מאז הסריקה; יש לסרוק מחדש.")
+                return false
+            }
+            if url.path.hasPrefix(temporaryRoot.path + "/") && oldTemporarySize(freshURL, cutoff: Date().addingTimeInterval(-7 * 24 * 60 * 60), maxEntries: 18_000, deadline: Date().addingTimeInterval(8)) == nil {
                 errors.append("\(url.lastPathComponent): הזמניים השתנו; יש לסרוק מחדש.")
                 return false
             }

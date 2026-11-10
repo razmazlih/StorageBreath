@@ -26,6 +26,17 @@ import Foundation
   var rejected = false
   engine.trash([fake]) { errors in rejected = !errors.isEmpty }
   precondition(rejected)
-  print("PASS: allocated bytes, minimum threshold, DerivedData classification, symlink exclusion, incomplete directory omission, unscanned path rejection")
+  // A replacement directory with the same mtime is a different cleanup target.
+  // Keep the original inode alive at another path so the filesystem cannot reuse it.
+  let originalDate = try derived.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate!
+  try fm.moveItem(at: derived, to: derived.deletingLastPathComponent().appendingPathComponent("OriginalBuild"))
+  try fm.createDirectory(at: derived, withIntermediateDirectories: true)
+  try Data([9]).write(to: derived.appendingPathComponent("important-new-file"))
+  try fm.setAttributes([.modificationDate: originalDate], ofItemAtPath: derived.path)
+  rejected = false
+  engine.trash(report.items) { errors in rejected = errors.count == 1 && errors[0].contains("השתנה") }
+  precondition(rejected)
+  precondition(fm.fileExists(atPath: derived.appendingPathComponent("important-new-file").path))
+  print("PASS: allocated bytes, minimum threshold, DerivedData classification, symlink exclusion, incomplete directory omission, unscanned path rejection, same-mtime replacement rejection")
  }
 }
