@@ -6,24 +6,7 @@ private final class EffectMotion: ObservableObject {
 
 struct AmbientBackground: View {
     var body: some View {
-        GeometryReader { geometry in
-            ZStack {
-                Palette.background
-                RadialGradient(colors: [Palette.iris.opacity(0.17), .clear], center: .topTrailing,
-                               startRadius: 0, endRadius: max(geometry.size.width, geometry.size.height) * 0.75)
-                RadialGradient(colors: [Palette.accent.opacity(0.08), .clear], center: .topLeading,
-                               startRadius: 0, endRadius: max(geometry.size.width, geometry.size.height) * 0.6)
-                RadialGradient(colors: [Palette.mint.opacity(0.045), .clear], center: .bottomLeading,
-                               startRadius: 0, endRadius: max(geometry.size.width, geometry.size.height) * 0.55)
-                Canvas { context, canvas in
-                    for x in stride(from: CGFloat(12), to: canvas.width, by: 28) {
-                        for y in stride(from: CGFloat(12), to: canvas.height, by: 28) {
-                            context.fill(Path(ellipseIn: CGRect(x: x, y: y, width: 1, height: 1)), with: .color(.white.opacity(0.035)))
-                        }
-                    }
-                }
-            }
-        }.ignoresSafeArea().allowsHitTesting(false).accessibilityHidden(true)
+        Palette.background.ignoresSafeArea().allowsHitTesting(false).accessibilityHidden(true)
     }
 }
 
@@ -152,12 +135,12 @@ struct AnimatedCheckStyle: ToggleStyle {
 }
 
 enum Palette {
-    static let accent = Color(red: 0.61, green: 0.70, blue: 1.0)
-    static let accentDeep = Color(red: 0.32, green: 0.36, blue: 0.80)
+    static let accent = Color(red: 0.42, green: 0.84, blue: 0.76)
+    static let accentDeep = Color(red: 0.10, green: 0.40, blue: 0.37)
     static let iris = Color(red: 0.57, green: 0.43, blue: 0.94)
-    static let surface = Color(red: 0.075, green: 0.093, blue: 0.15)
+    static let surface = Color(red: 0.075, green: 0.11, blue: 0.13)
     static let mint = Color(red: 0.40, green: 0.84, blue: 0.73)
-    static let background = Color(red: 0.027, green: 0.037, blue: 0.065)
+    static let background = Color(red: 0.035, green: 0.055, blue: 0.07)
 }
 
 /// A small, native vector companion for “מקום לנשום”. Motion communicates state,
@@ -318,12 +301,12 @@ struct StudioButtonStyle: ButtonStyle {
                 .font(.system(size: 12, weight: .semibold))
                 .symbolRenderingMode(.hierarchical)
                 .padding(.horizontal, 11).padding(.vertical, 7)
-                .frame(minHeight: 28)
+                .frame(minHeight: 32)
                 .foregroundStyle(prominent ? Color.white : Color.white.opacity(0.86))
                 .background {
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
                         .fill(LinearGradient(colors: prominent
-                            ? [Color(red: 0.43, green: 0.49, blue: 0.96), Palette.accentDeep, Palette.iris.opacity(0.8)]
+                            ? [Palette.accentDeep, Color(red: 0.12, green: 0.46, blue: 0.42)]
                             : [Color.white.opacity(hovered ? 0.105 : 0.065), Color.white.opacity(hovered ? 0.045 : 0.025)],
                             startPoint: .topLeading, endPoint: .bottomTrailing))
                 }
@@ -331,7 +314,7 @@ struct StudioButtonStyle: ButtonStyle {
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
                         .stroke(LinearGradient(colors: [.white.opacity(prominent ? 0.3 : hovered ? 0.22 : 0.12), .white.opacity(0.025)], startPoint: .top, endPoint: .bottom), lineWidth: 1)
                 }
-                .shadow(color: prominent ? Palette.iris.opacity(hovered ? 0.24 : 0.1) : .black.opacity(0.13), radius: hovered ? 12 : 5, y: 3)
+
                 .scaleEffect(reduceMotion || !enabled ? 1 : configuration.isPressed ? 0.97 : 1)
                 .offset(y: reduceMotion || !enabled || !hovered || configuration.isPressed ? 0 : -1)
                 .opacity(enabled ? 1 : 0.34)

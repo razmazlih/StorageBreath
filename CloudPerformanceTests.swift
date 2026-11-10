@@ -56,6 +56,18 @@ import Foundation
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         precondition(model.visible.count == 1 && model.visible.first?.id == searchItem.id, "Search tokens must match across name/path without requiring a phrase")
-        print("PASS: cloud selection latest generation, amount modes, protection refresh, empty selection, cancellable sorting")
+        // Selection IDs from an old AI session must not make read-only files actionable.
+        model.selected = [searchItem.id]
+        try await settle()
+        precondition(model.chosen.isEmpty && model.amount == 0, "Read-only cloud items cannot enter an action selection")
+        model.openAI()
+        model.items = []
+        try await Task.sleep(nanoseconds: 100_000_000)
+        precondition(!model.ai && !model.preparingAI, "Inventory replacement invalidates pending AI preparation")
+        precondition(model.visible.isEmpty, "A previous filter must not restore an obsolete inventory")
+        model.busy = true
+        model.scan()
+        precondition(model.busy && !model.scanning, "An operation in progress must reject overlapping scans")
+        print("PASS: cloud selection latest generation, eligibility, amount modes, protection refresh, cancellable sorting, stale inventory/AI invalidation, overlapping scan rejection")
     }
 }

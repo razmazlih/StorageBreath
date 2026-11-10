@@ -33,6 +33,15 @@ import Foundation
         model.togglePage()
         try await wait { model.chosenCount == 1 && model.chosen.count == 1 }
         precondition(model.chosenBytes == 99999 && model.chosen[0].title == "file-99999.tmp")
+        model.selected = ["/private/tmp/fixture/file-1.tmp"]
+        precondition(model.selectionLoading && model.chosen.isEmpty && model.chosenCount == 0 && model.chosenBytes == 0,
+                     "Changing selection must immediately invalidate the previous review summary")
+        model.clean()
+        precondition(!model.cleaning, "Cleanup must wait for the current selection summary")
+        model.selected = []
+        precondition(!model.selectionLoading && model.chosen.isEmpty)
+        try await Task.sleep(nanoseconds:100_000_000)
+        precondition(model.chosenCount == 0 && model.chosenBytes == 0, "A stale selection result must not restore cleared files")
         precondition(model.performance == .background)
         let reopened = ExplorerModel(database:try InventoryDatabase(url:database.url))
         try await wait { reopened.inventoryCount == 100000 && !reopened.filtering }

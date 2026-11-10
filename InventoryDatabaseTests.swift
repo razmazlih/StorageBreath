@@ -28,6 +28,26 @@ import SQLite3
         precondition(stats.categories.count == 2)
         let page = try db.query(request:InventoryQuery())
         precondition(page.total == 20000 && page.files.count == 100 && page.files.first?.bytes == 19999)
+        // Category browsing uses maintained totals without weakening filters.
+        let categoryPage = try db.query(request:InventoryQuery(section:"מסמכים"))
+        precondition(categoryPage.total == 10000 && categoryPage.files.first?.bytes == 19999)
+        try check(try db.query(request:InventoryQuery(section:"זמניים")).total == 10000)
+        try check(try db.query(request:InventoryQuery(section:"missing-category")).total == 0)
+        try check(try db.query(request:InventoryQuery(section:"מסמכים",minimum:19990)).total == 5)
+        try check(try db.query(request:InventoryQuery(section:"מסמכים",actionableOnly:true)).total == 8000)
+        try check(try db.query(request:InventoryQuery(section:"זמניים",protected:[ProtectionEntry(path:item(2).path,until:nil)])).total == 9999)
+        try check(try db.query(request:InventoryQuery(search:"REPORT-19999",section:"מסמכים")).total == 1)
+        // The category page is delivered in index order, without sorting all
+        // matching files before LIMIT can return the first page.
+        var categoryHandle: OpaquePointer?
+        precondition(sqlite3_open_v2(url.path,&categoryHandle,SQLITE_OPEN_READONLY,nil) == SQLITE_OK)
+        var categoryPlan: OpaquePointer?
+        precondition(sqlite3_prepare_v2(categoryHandle,"EXPLAIN QUERY PLAN SELECT path FROM files WHERE category='מסמכים' ORDER BY bytes DESC,path LIMIT 100",-1,&categoryPlan,nil) == SQLITE_OK)
+        var categoryDetails: [String] = []
+        while sqlite3_step(categoryPlan) == SQLITE_ROW { categoryDetails.append(String(cString:sqlite3_column_text(categoryPlan,3))) }
+        sqlite3_finalize(categoryPlan); sqlite3_close(categoryHandle)
+        precondition(categoryDetails.contains { $0.contains("files_category_size") })
+        precondition(!categoryDetails.contains { $0.contains("TEMP B-TREE") })
         let limited = try db.query(request:InventoryQuery(limit:99999))
         precondition(limited.files.count == 500)
         var search = InventoryQuery(search:"קובץ מוסתר",sort:"name")
@@ -42,8 +62,10 @@ import SQLite3
         try check(try db.query(request:nextPage).total == 20000)
         let peer = try InventoryDatabase(url:url)
         try peer.remove(paths:[item(19999).path])
+        try check(try db.query(request:InventoryQuery(section:"מסמכים")).total == 9999)
         try check(try db.query(request:nextPage).total == 19999)
         try peer.insert(file:item(19999),snapshot:nil)
+        try check(try db.query(request:InventoryQuery(section:"מסמכים")).total == 10000)
         try check(try db.query(request:nextPage).total == 20000)
         try check(try db.query(request:InventoryQuery(minimum:19990)).total == 10)
         var expiring = InventoryQuery(protected:[ProtectionEntry(path:item(2).path,until:Date().addingTimeInterval(0.1))])

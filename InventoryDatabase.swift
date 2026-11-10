@@ -75,7 +75,8 @@ final class InventoryDatabase: @unchecked Sendable {
             CREATE INDEX IF NOT EXISTS files_size ON files(bytes DESC,path);
             CREATE INDEX IF NOT EXISTS files_modified ON files(modified,path);
             CREATE INDEX IF NOT EXISTS files_title ON files(title COLLATE NOCASE,path);
-            CREATE INDEX IF NOT EXISTS files_category ON files(category);
+            CREATE INDEX IF NOT EXISTS files_category_size ON files(category,bytes DESC,path);
+            DROP INDEX IF EXISTS files_category;
             CREATE TABLE IF NOT EXISTS issues (id INTEGER PRIMARY KEY, path TEXT NOT NULL, reason TEXT NOT NULL, UNIQUE(path,reason));
             CREATE TABLE IF NOT EXISTS totals (singleton INTEGER PRIMARY KEY CHECK(singleton=1), count INTEGER NOT NULL, bytes INTEGER NOT NULL, temporary_count INTEGER NOT NULL, temporary_bytes INTEGER NOT NULL);
             INSERT OR IGNORE INTO totals VALUES(1,0,0,0,0);
@@ -310,11 +311,30 @@ final class InventoryDatabase: @unchecked Sendable {
             let total: Int
             if let cached { total = cached }
             else {
-                // The unfiltered inventory already maintains an exact count.
-                let countSQL = whereSQL.isEmpty ? "SELECT count FROM totals WHERE singleton=1" : "SELECT COUNT(*) FROM files f" + whereSQL
+                // Category navigation can reuse transactionally maintained totals,
+                // even while scans invalidate the count cache on every batch.
+                // Any additional filter/protection requires the exact filtered count.
+                let aggregateOnly = request.search.split(whereSeparator: { $0.isWhitespace }).isEmpty
+                    && request.minimum <= 0 && request.ageDays <= 0
+                    && !request.actionableOnly && request.protected.isEmpty
+                let countSQL: String
+                let countBindings: [Value]
+                if aggregateOnly && request.section == "הכול" {
+                    countSQL = "SELECT count FROM totals WHERE singleton=1"
+                    countBindings = []
+                } else if aggregateOnly && request.section == "זמניים" {
+                    countSQL = "SELECT temporary_count FROM totals WHERE singleton=1"
+                    countBindings = []
+                } else if aggregateOnly && request.section != "גדולים" {
+                    countSQL = "SELECT COALESCE((SELECT count FROM categories WHERE category=?),0)"
+                    countBindings = [.text(request.section)]
+                } else {
+                    countSQL = "SELECT COUNT(*) FROM files f" + whereSQL
+                    countBindings = bindings
+                }
                 let count = try Self.prepare(db,countSQL)
                 defer { sqlite3_finalize(count) }
-                try Self.bind(bindings,to:count,db:db)
+                try Self.bind(countBindings,to:count,db:db)
                 guard sqlite3_step(count) == SQLITE_ROW else { throw Failure.sqlite(String(cString:sqlite3_errmsg(db))) }
                 total = Int(sqlite3_column_int64(count,0))
                 // A moving age cutoff must always be reevaluated.

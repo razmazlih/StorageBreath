@@ -72,6 +72,7 @@ extension DeepFile {
     @Published var temporaryBytes: Int64 = 0
     @Published var totalBytes: Int64 = 0
     @Published var categoryStats: [(String,Int64)] = []
+    @Published private(set) var selectionLoading = false
     @Published var selectionNotice = ""
     @Published var selectionPreview: [DeepFile] = []
     @Published var selectionCount = 0
@@ -206,11 +207,13 @@ extension DeepFile {
     func refreshSelection() {
         guard let database else { return }
         let generation = selectionEpoch.advance(), epoch = selectionEpoch, paths = Array(selected), protected = ProtectionStore.shared.entries()
-        if paths.isEmpty { selectionPreview = []; selectionCount = 0; selectionBytes = 0; return }
+        selectionPreview = []; selectionCount = 0; selectionBytes = 0
+        selectionLoading = !paths.isEmpty
+        if paths.isEmpty { return }
         selectionQueue.async {
             guard epoch.current(generation) else { return }
-            do { let result = try database.selected(paths:paths,limit:100,protected:protected,isCancelled:{ !epoch.current(generation) }); DispatchQueue.main.async { guard epoch.current(generation) else { return }; self.selectionPreview = result.files; self.selectionCount = result.total; self.selectionBytes = result.bytes } }
-            catch { DispatchQueue.main.async { guard epoch.current(generation) else { return }; self.storageError = error.localizedDescription } }
+            do { let result = try database.selected(paths:paths,limit:100,protected:protected,isCancelled:{ !epoch.current(generation) }); DispatchQueue.main.async { guard epoch.current(generation) else { return }; self.selectionPreview = result.files; self.selectionCount = result.total; self.selectionBytes = result.bytes; self.selectionLoading = false } }
+            catch { DispatchQueue.main.async { guard epoch.current(generation) else { return }; self.selectionLoading = false; self.storageError = error.localizedDescription } }
         }
     }
     func selectVisible() {
@@ -270,6 +273,7 @@ extension DeepFile {
     func loadIssues(offset:Int = 0) { guard let database else { coverage = true; return }; ioQueue.async { do { let rows = try database.issues(offset:offset,limit:500); DispatchQueue.main.async { self.issues = rows; self.issueOffset = offset; self.coverage = true } } catch { DispatchQueue.main.async { self.storageError = error.localizedDescription } } } }
     func stopCleanup() { cleanupGate.cancel(); engine.cancelCleanup() }
     func clean() {
+        guard !busy, !selectionLoading else { return }
         let paths = Array(selected); guard !paths.isEmpty else { return }
         cleaning = true; cleanupDone = 0; cleanupTotal = paths.count; cleanupPath = "בודק קבצים והגנות…"; cleanupGate.reset()
         let worker = engine, database = self.database, gate = cleanupGate, fallback = chosen
@@ -357,17 +361,28 @@ struct DashboardView: View {
     @State private var showFilters = false
     @State private var filterGroup = "מיון"
     @State private var showSelectionActions = false
+    @FocusState private var searchFocused: Bool
     var body: some View {
+        GeometryReader { geometry in
+        HStack(spacing: 0) {
+            if geometry.size.width >= 1000 { sidebar }
         VStack(spacing: 0) {
-            compactNavigation
+            if geometry.size.width < 1000 { compactNavigation }
             if model.cloud { CloudView().frame(maxWidth: .infinity).transition(.opacity) } else {
                 VStack(spacing: 0) {
                     fixedToolbar
-                    ScrollView(.vertical) { fileList.padding(.horizontal, 16).padding(.vertical, 8).frame(maxWidth: 1180).frame(maxWidth: .infinity) }
+                    ScrollView(.vertical) { VStack(spacing: 18) {
+                        if !model.completed && !model.scanning && !model.loadingIndex { welcomeCard }
+                        if model.completed { coverageBanner }
+                        if !model.storageError.isEmpty { Text(model.storageError).foregroundStyle(.orange).textSelection(.enabled) }
+                        fileList
+                    }.padding(.horizontal, 16).padding(.vertical, 8).frame(maxWidth: 1180).frame(maxWidth: .infinity) }
                         .frame(maxHeight: .infinity)
                     bottomBar
                 }.frame(maxWidth: .infinity, maxHeight: .infinity).background(AmbientBackground()).transition(.opacity)
             }
+        }
+        }
         }.preferredColorScheme(.dark).tint(Palette.accent).buttonStyle(StudioButtonStyle())
         .sheet(isPresented: $showSummary) { summarySheet }
         .sheet(isPresented: $showFilters) { filterSheet }
@@ -390,6 +405,46 @@ struct DashboardView: View {
         .sheet(isPresented: $model.result) { cleanupReceipt }
         .onChange(of: protection.revision) { _ in if !model.scanning { model.rebuild(); model.refreshSelection() } }
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: model.cloud)
+    }
+    var sidebar: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            HStack(spacing: 10) {
+                Image(systemName: "leaf.fill").font(.title2).foregroundStyle(Palette.accent)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("מקום לנשום").font(.title3.bold())
+                    Text("סדר חדש באחסון").font(.caption).foregroundStyle(.secondary)
+                }
+            }.padding(.top, 20)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("האחסון שלי").font(.caption).foregroundStyle(.secondary).padding(.bottom, 4)
+                sidebarItem("כל הקבצים", "internaldrive", "הכול")
+                sidebarItem("קבצים גדולים", "chart.bar", "גדולים")
+                sidebarItem("זמניים ומטמונים", "archivebox", "זמניים")
+                Button { model.cloud = true } label: {
+                    Label("iCloud Drive", systemImage: "icloud").frame(maxWidth: .infinity, alignment: .leading).padding(12)
+                        .background(model.cloud ? Palette.accent.opacity(0.14) : .clear, in: RoundedRectangle(cornerRadius: 10))
+                }.buttonStyle(.plain)
+            }
+            Divider()
+            Button { protection.manager = true } label: { Label("קבצים מוגנים", systemImage: "lock.shield") }
+            Button { permissions.show = true } label: { Label("גישה והרשאות", systemImage: "hand.raised") }
+            Spacer()
+            VStack(alignment: .leading, spacing: 10) {
+                Label("הקבצים נשארים אצלכם", systemImage: "lock")
+                Text("סורקים, בודקים ורק אז מאשרים. הבחירה תמיד שלכם.").foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }.font(.caption).padding(14).studioPanel()
+        }.padding(20).frame(width: 224).frame(maxHeight: .infinity)
+            .background(Palette.surface.opacity(0.65))
+            .overlay(alignment: .trailing) { Rectangle().fill(.white.opacity(0.07)).frame(width: 1) }
+    }
+    func sidebarItem(_ title: String, _ icon: String, _ section: String) -> some View {
+        let active = !model.cloud && model.section == section
+        return Button { model.cloud = false; model.section = section } label: {
+            HStack { Image(systemName: icon).frame(width: 20); Text(title); Spacer(); if active { Circle().fill(Palette.accent).frame(width: 6, height: 6) } }
+                .font(.system(size: 14, weight: active ? .semibold : .regular)).padding(12)
+                .foregroundStyle(active ? Palette.accent : Color.primary)
+                .background(active ? Palette.accent.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 10))
+        }.buttonStyle(.plain).accessibilityAddTraits(active ? .isSelected : [])
     }
     var compactNavigation: some View {
         VStack(spacing: 6) {
@@ -441,50 +496,61 @@ struct DashboardView: View {
             .contentShape(Capsule()).fixedSize()
     }
     var fixedToolbar: some View {
-        VStack(spacing: 7) {
-            HStack(spacing: 8) {
-                if model.scanning {
-                    Button(model.paused ? "המשך" : "השהה") { model.togglePause() }
-                    Button { model.engine.cancel() } label: { Label("עצור", systemImage: "stop.fill") }
-                } else {
-                    if model.resumeAvailable { Button { model.requestScan(resume: true) } label: { Label("המשך", systemImage: "play.fill") }.disabled(model.cleaning) }
-                    Button { model.requestScan() } label: { Label(model.completed ? "סריקה מחדש" : "סריקה", systemImage: "viewfinder") }.buttonStyle(StudioButtonStyle(prominent: true)).disabled(model.cleaning)
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(model.section == "הכול" ? "האחסון במק" : model.section == "גדולים" ? "קבצים גדולים" : "זמניים ומטמונים")
+                        .font(.system(size: 25, weight: .bold, design: .rounded))
+                    Text(model.completed ? "\(model.inventoryCount.formatted()) קבצים מופו · \(size(model.totalBytes)) לבדיקה" : "מגלים מה תופס מקום. בוחרים מה לשמור.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
-                Button(action: model.chooseRoot) { Label("תיקייה", systemImage: "folder.badge.plus") }.disabled(model.busy)
-                Button("סיכום והגדרות") { showSummary = true }
-                Button("סינון ומיון") { showFilters = true }
                 Spacer(minLength: 0)
-                Button("כיסוי") { model.loadIssues() }.disabled(!model.completed && !model.scanning)
+                if model.scanning {
+                    Button(model.paused ? "המשך סריקה" : "השהה") { model.togglePause() }
+                    Button("עצור") { model.engine.cancel() }
+                } else {
+                    Button { model.requestScan() } label: { Label(model.completed ? "סריקה מחדש" : "התחילו בסריקה", systemImage: "magnifyingglass") }
+                        .buttonStyle(StudioButtonStyle(prominent: true)).disabled(model.cleaning || model.loadingIndex)
+                }
             }
             HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField("חיפוש בשם, בנתיב או בסיווג", text: $model.query).textFieldStyle(.plain)
-                if !model.query.isEmpty { Button { model.query = "" } label: { Image(systemName: "xmark.circle.fill") }.buttonStyle(.plain) }
-                Text(model.filtering ? "מסנן…" : "\(model.matchCount.formatted()) תוצאות").font(.caption2).foregroundStyle(.secondary).fixedSize()
-                Button("איפוס") { resetFilters() }
-            }.padding(.horizontal, 10).padding(.vertical, 5).studioPanel(radius: 11, accented: true)
-            HStack(spacing: 8) {
-                Button("מועמדים") { model.selectVisible() }.disabled(model.busy || model.filtering).help("מסמן תוצרי מטמון מוכרים בני 30 יום לפחות בכל התוצאות המסוננות")
-                Button("בחר עמוד") { model.togglePage() }.disabled(model.busy || model.filtering)
-                Button("נקה") { model.selected = [] }.disabled(model.selected.isEmpty)
-                Button { model.openAI() } label: { Label("AI", systemImage: "sparkles") }.disabled(!model.completed || model.busy || model.preparingAI)
-                Button("פעולות בבחירה") { showSelectionActions = true }.disabled(model.chosenCount == 0 || model.busy)
+                Button(action: model.chooseRoot) { Label("בחירת תיקייה", systemImage: "folder.badge.plus") }.disabled(model.busy)
+                Button { showSummary = true } label: { Label("סיכום והגדרות", systemImage: "slider.horizontal.3") }
+                if model.resumeAvailable && !model.scanning { Button("המשך סריקה שמורה") { model.requestScan(resume: true) }.disabled(model.busy) }
                 Spacer(minLength: 0)
-                Text(activeFilterSummary).font(.caption2).foregroundStyle(.secondary).lineLimit(1).help(activeFilterSummary)
+            }
+            HStack(spacing: 10) {
+                Image(systemName: "magnifyingglass").foregroundStyle(Palette.accent)
+                TextField("חיפוש קבצים או תיקיות…", text: $model.query).textFieldStyle(.plain).focused($searchFocused)
+                if !model.query.isEmpty { Button { model.query = "" } label: { Image(systemName: "xmark.circle.fill") }.buttonStyle(.plain).help("נקה חיפוש") }
+                Text(model.filtering ? "מחפש…" : "\(model.matchCount.formatted()) תוצאות").font(.caption).foregroundStyle(.secondary).fixedSize()
+                Button { showFilters = true } label: { Label("סינון ומיון", systemImage: "line.3.horizontal.decrease") }
+            }.padding(10).studioPanel(radius: 12, accented: searchFocused)
+            HStack(spacing: 8) {
+                Button("בחר עמוד") { model.togglePage() }.disabled(model.busy || model.filtering || model.pageFiles.isEmpty)
+                Button("מועמדים לבדיקה") { model.selectVisible() }.disabled(model.busy || model.filtering || !model.completed).help("תוצרי מטמון מוכרים בני 30 יום לפחות בכל התוצאות המסוננות")
+                if !model.selected.isEmpty {
+                    Button("בטל בחירה") { model.selected = [] }
+                    Button("פעולות") { showSelectionActions = true }.disabled(model.busy)
+                }
+                Spacer(minLength: 0)
+                Button { model.openAI() } label: { Label("עזרה מ־AI", systemImage: "sparkles") }.disabled(!model.completed || model.busy || model.preparingAI)
+            }.font(.caption)
+            if !model.query.isEmpty || model.minimum > 0 || model.age > 0 {
+                HStack { Text(activeFilterSummary).font(.caption).foregroundStyle(.secondary); Spacer(); Button("איפוס מסננים") { resetFilters() } }
             }
             if model.scanning || model.cleaning || model.preparingAI || model.loadingIndex {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
-                    Text(model.cleaning ? "מעביר לפח · \(model.cleanupDone)/\(model.cleanupTotal)" : model.preparingAI ? "מכין נתונים ל־AI" : model.loadingIndex ? "טוען אינדקס" : "\(model.progress.found.formatted()) קבצים · \(model.paused ? "מושהה" : "סורק")").font(.caption2).foregroundStyle(.secondary)
+                    Text(model.cleaning ? "מעביר לפח · \(model.cleanupDone)/\(model.cleanupTotal)" : model.preparingAI ? "מכין נתונים ל־AI" : model.loadingIndex ? "טוען את הסריקה השמורה" : "\(model.progress.found.formatted()) קבצים · \(model.paused ? "מושהה" : "סורק")").font(.caption).foregroundStyle(.secondary)
                     Spacer(minLength: 0)
                     if model.cleaning { Button("עצור פעולות נוספות") { model.stopCleanup() } }
                     if model.preparingAI { Button("בטל הכנה") { model.cancelPreparingAI() } }
                 }
             }
-        }.buttonStyle(StudioButtonStyle()).font(.caption)
-            .padding(.horizontal, 16).padding(.vertical, 8).frame(maxWidth: 1180).frame(maxWidth: .infinity)
-            .background(LinearGradient(colors: [Color.white.opacity(0.025), Color.white.opacity(0.008)], startPoint: .top, endPoint: .bottom))
-            .overlay(alignment: .bottom) { Rectangle().fill(Color.white.opacity(0.045)).frame(height: 1) }
+        }.padding(20).frame(maxWidth: 1180).frame(maxWidth: .infinity)
+            .background(Palette.background)
+            .background(Button("") { searchFocused = true }.keyboardShortcut("f", modifiers: .command).hidden())
     }
     func resetFilters() { model.query = ""; model.minimum = 0; model.age = 0; model.section = "הכול" }
     var activeFilterSummary: String {
@@ -704,7 +770,7 @@ struct DashboardView: View {
                         .frame(width: 68, height: 68).background(Palette.accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 20))
                     Text(model.loadingIndex ? "פותחים את התמונה האחרונה…" : model.scanning ? "מגלים מה נמצא במק…" : model.completed ? "לא נמצאו קבצים בתצוגה הזו" : "הקבצים שלכם יופיעו כאן")
                         .font(.headline)
-                    Text(model.scanning ? "התוצאות מתעדכנות לאורך הסריקה. אפשר להשהות בכל רגע." : model.completed ? "אפשר לנסות חיפוש אחר, לשנות קטגוריה או לאפס את המסננים." : "לחצו על ״התחילו בסריקה״ למעלה. הסריקה רק מציגה קבצים.")
+                    Text(model.scanning ? "התוצאות מתעדכנות לאורך הסריקה. אפשר להשהות בכל רגע." : model.completed ? "אפשר לנסות חיפוש אחר, לשנות קטגוריה או לאפס את המסננים." : "התחילו בסריקה כדי לראות מה תופס מקום במק.")
                         .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
                 }.frame(maxWidth: .infinity).padding(36)
             }
@@ -741,7 +807,7 @@ struct DashboardView: View {
                     .background(file.cleanupAssessment.recommendationEligible ? Palette.accent.opacity(0.075) : Color(red: 0.43, green: 0.43, blue: 0.64).opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
                 VStack(alignment:.leading,spacing:5) {
                     Text(file.title).font(.system(size: 13, weight: .semibold)).lineLimit(2).foregroundStyle(.white.opacity(0.9))
-                    Text((file.path as NSString).deletingLastPathComponent).font(.system(size: 10, design:.monospaced)).foregroundStyle(.white.opacity(0.35)).lineLimit(1).truncationMode(.middle).environment(\.layoutDirection,.leftToRight)
+                    Text((file.path as NSString).deletingLastPathComponent).font(.system(size: 10, design:.monospaced)).foregroundStyle(.white.opacity(0.6)).lineLimit(1).truncationMode(.middle).environment(\.layoutDirection,.leftToRight)
                 }.frame(maxWidth:.infinity,alignment:.leading)
             }.contentShape(Rectangle())
         }.buttonStyle(.plain)
@@ -752,9 +818,9 @@ struct DashboardView: View {
     var bottomBar: some View {
         VStack(spacing: 6) {
             HStack(spacing: 10) {
-                Text(model.chosenCount == 0 ? "סמנו קבצים לבדיקה" : "\(model.chosenCount.formatted()) נבחרו · \(size(model.chosenBytes))").font(.system(size:12,weight:.semibold)).lineLimit(1)
+                Text(model.selectionLoading ? "מחשב את הבחירה…" : model.chosenCount == 0 ? "סמנו קבצים לבדיקה" : "\(model.chosenCount.formatted()) נבחרו · \(size(model.chosenBytes))").font(.system(size:12,weight:.semibold)).lineLimit(1)
                 Spacer(minLength: 0)
-                Button { model.confirm = true } label: { Label("סקירה והעברה לפח",systemImage:"trash") }.buttonStyle(StudioButtonStyle(prominent: true)).fixedSize().disabled(model.chosenCount == 0 || model.busy)
+                Button { model.confirm = true } label: { Label("סקירה והעברה לפח",systemImage:"trash") }.buttonStyle(StudioButtonStyle(prominent: true)).fixedSize().disabled(model.chosenCount == 0 || model.busy || model.selectionLoading)
             }
             HStack {
                 Button("הקודם") { model.page -= 1 }.disabled(model.page == 0)
@@ -804,7 +870,7 @@ struct DashboardView: View {
             Text("תצוגה מקדימה של עד 100 קבצים; הפעולה תחול על כל הבחירה.").font(.caption2).foregroundStyle(.secondary)
             LazyVStack(alignment:.leading,spacing:9) { ForEach(model.chosen) { file in HStack { Text(file.title).lineLimit(1); Spacer(); Text(size(file.bytes)).foregroundStyle(.secondary) }.font(.caption) } }
             } }
-            ResponsiveRow { Button("ביטול") { model.confirm = false }.buttonStyle(MotionButtonStyle(prominent:false)); Spacer(); Button("העבר לפח") { model.confirm = false; model.clean() }.buttonStyle(MotionButtonStyle()).disabled(model.chosenCount == 0) }
+            ResponsiveRow { Button("ביטול") { model.confirm = false }.buttonStyle(MotionButtonStyle(prominent:false)); Spacer(); Button("העבר לפח") { model.confirm = false; model.clean() }.buttonStyle(MotionButtonStyle()).disabled(model.chosenCount == 0 || model.busy || model.selectionLoading) }
         }.padding(20).responsiveSheet(width: 580, height: 520).environment(\.layoutDirection,.rightToLeft).preferredColorScheme(.dark)
     }
     var coverageSheet: some View {

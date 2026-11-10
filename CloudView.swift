@@ -31,7 +31,7 @@ private final class CloudWorkEpoch: @unchecked Sendable {
 
 @MainActor final class CloudModel: ObservableObject {
     static let shared = CloudModel()
-    @Published var items: [CloudItem] = [] { didSet { refreshSelection() } }
+    @Published var items: [CloudItem] = [] { didSet { cancelAI(); refreshSelection(); rebuild() } }
     @Published var ai = false
     @Published private(set) var preparingAI = false
     @Published private(set) var aiCandidates: [AICandidate] = []
@@ -76,7 +76,7 @@ private final class CloudWorkEpoch: @unchecked Sendable {
             var output: [CloudItem] = [], bytes: Int64 = 0
             for (index, item) in inventory.enumerated() {
                 if index % 256 == 0 && !epoch.current(generation) { return }
-                if ids.contains(item.id) && !protected(item.path) {
+                if ids.contains(item.id) && (local ? item.canEvict : item.canDelete) && !protected(item.path) {
                     output.append(item); bytes += local ? item.localBytes : item.logicalBytes
                 }
             }
@@ -87,7 +87,7 @@ private final class CloudWorkEpoch: @unchecked Sendable {
             }
         }
     }
-    func protectionsChanged() { refreshSelection(); rebuild() }
+    func protectionsChanged() { cancelAI(); refreshSelection(); rebuild() }
     var pageCount: Int { max(1,(visible.count+99)/100) }
     var pageItems: [CloudItem] { let lower = min(page*100,visible.count); return Array(visible[lower..<min(lower+100,visible.count)]) }
     func scheduleFilter() { _ = filterEpoch.advance(); filterWork?.cancel(); let work = DispatchWorkItem { [weak self] in self?.rebuild() }; filterWork = work; DispatchQueue.main.asyncAfter(deadline:.now()+0.2,execute:work) }
@@ -129,6 +129,7 @@ private final class CloudWorkEpoch: @unchecked Sendable {
         }
     }
     func scan() {
+        guard !busy else { return }
         cancelAI()
         guard PermissionSetup.shared.prepared else { PermissionSetup.shared.show = true; return }
         let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Mobile Documents").path
@@ -170,52 +171,49 @@ struct CloudView: View {
     @ObservedObject private var protection = ProtectionUI.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var showScanDetails = false
+    @State private var showSelectionTools = false
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            VStack(alignment: .leading, spacing: 7) {
-                HStack(spacing: 10) {
-                    BreathCompanion(mode: model.scanning ? .searching : (model.cleanupSucceeded ? .relieved : .ready), diameter: 40)
-                    Text("סריקה וניקוי iCloud").font(.system(size: 22, weight: .bold, design: .rounded)).tracking(-0.35)
-                    Spacer(minLength: 4)
-                    Button("פרטי הסריקה") { showScanDetails = true }.buttonStyle(StudioButtonStyle()).font(.caption)
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("האחסון בענן").font(.system(size: 26, weight: .bold, design: .rounded))
+                        Text("iCloud Drive · בוחרים מה נשאר במק")
+                            .font(.subheadline).foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 8)
                     if model.scanning {
-                        Button("עצור") { model.engine.cancel() }.buttonStyle(StudioButtonStyle())
+                        Button { model.engine.cancel() } label: { Label("עצירת הסריקה", systemImage: "stop.fill") }
                     } else {
-                        Button(action: model.scan) { Label("סריקה", systemImage: "arrow.clockwise") }.buttonStyle(StudioButtonStyle(prominent: true)).disabled(model.busy)
+                        Button(action: model.scan) { Label(model.scanned ? "סריקה מחדש" : "סריקת iCloud", systemImage: "magnifyingglass") }
+                            .buttonStyle(StudioButtonStyle(prominent: true)).disabled(model.busy)
                     }
                 }
-                HStack(spacing: 8) {
-                    cloudModeButton(localOnly: true, title: "פינוי עותק מהמק", icon: "internaldrive")
-                    cloudModeButton(localOnly: false, title: "מחיקה מ־iCloud", icon: "trash")
+                HStack(spacing: 10) {
+                    cloudModeButton(localOnly: true, title: "פינוי מקום במק", icon: "internaldrive")
+                    cloudModeButton(localOnly: false, title: "העברה לפח בענן", icon: "trash")
                 }.disabled(model.busy)
                     .onChange(of: model.evict) { _ in model.selected = []; model.rebuild() }
-                Label(model.evict ? "המקור נשאר בענן · מכסת iCloud אינה משתנה" : "העברה לפח ב־iCloud ובכל המכשירים המסונכרנים", systemImage: model.evict ? "checkmark.shield" : "exclamationmark.icloud")
-                    .font(.caption).foregroundStyle(model.evict ? Palette.accent : Color.orange).lineLimit(1)
-                FileTools(search: $model.search, sort: $model.sort)
-                HStack(spacing: 10) {
-                    Toggle("הצעות בלבד", isOn: $model.suggestionsOnly).toggleStyle(.checkbox).disabled(model.busy)
-                    Button("הכול") { model.search = ""; model.suggestionsOnly = false; model.rebuild() }
-                        .help("הצג את כל התוצאות הלא מוגנות")
-                    if model.evict {
-                        Button("בחר זמינים") { model.selected.formUnion(model.visible.filter { $0.canEvict && !ProtectionStore.shared.isProtected($0.path) }.map(\.id)) }.disabled(model.busy)
-                    }
-                    Button("נקה בחירה") { model.selected = [] }.disabled(model.busy || model.selected.isEmpty)
-                    Spacer(minLength: 0)
-                    if model.preparingAI {
-                        ProgressView().controlSize(.mini)
-                        Button("בטל AI") { model.cancelAI() }
-                    } else {
-                        Button(action: model.openAI) { Label("AI", systemImage: "sparkles") }.disabled(model.busy || !model.scanned)
-                    }
-                    Button("כיסוי") { model.showIssues = true }.disabled(!model.scanned)
-                }.font(.caption).buttonStyle(StudioButtonStyle())
-                HStack(spacing: 6) {
-                    if model.busy { ProgressView().controlSize(.mini) }
-                    Text(model.scanning ? "סורק · \(model.scanProgress.found) קבצים נמצאו" : "\(model.visible.count) מוצגים מתוך \(model.items.count) קבצים")
-                    Spacer(minLength: 0)
-                    Label("מיפוי אינו המלצה למחיקה", systemImage: "checkmark.shield").foregroundStyle(.secondary)
-                }.font(.caption2).foregroundStyle(.secondary).lineLimit(1).padding(.horizontal, 3)
-            }.fixedSize(horizontal: false, vertical: true)
+                if model.scanned || model.busy {
+                    FileTools(search: $model.search, sort: $model.sort)
+                    HStack(spacing: 8) {
+                        Toggle("הצעות לבדיקה", isOn: $model.suggestionsOnly).toggleStyle(.checkbox).disabled(model.busy)
+                        if !model.search.isEmpty || model.suggestionsOnly {
+                            Button("איפוס") { model.search = ""; model.suggestionsOnly = false; model.rebuild() }
+                        }
+                        Spacer(minLength: 0)
+                        Button("כלי בחירה") { showSelectionTools = true }.disabled(model.busy)
+                        Button { showScanDetails = true } label: { Label("פרטי סריקה", systemImage: "info.circle") }
+                    }.font(.caption)
+                    HStack(spacing: 6) {
+                        if model.busy || model.preparingAI { ProgressView().controlSize(.mini) }
+                        Text(model.scanning ? "סורק · \(model.scanProgress.found.formatted()) קבצים נמצאו" : "\(model.visible.count.formatted()) תוצאות מתוך \(model.items.count.formatted()) קבצים")
+                        Spacer(minLength: 0)
+                        if model.preparingAI { Button("ביטול הכנת AI") { model.cancelAI() } }
+                        else { Button("דוח כיסוי") { model.showIssues = true }.disabled(!model.scanned) }
+                    }.font(.caption).foregroundStyle(.secondary)
+                }
+            }.buttonStyle(StudioButtonStyle()).fixedSize(horizontal: false, vertical: true)
             ScrollView {
             if !model.scanned && !model.busy {
                 VStack(spacing: 14) {
@@ -242,7 +240,7 @@ struct CloudView: View {
                                     .overlay(RoundedRectangle(cornerRadius: 13).stroke(Palette.accent.opacity(0.15), lineWidth: 1))
                                 VStack(alignment: .leading, spacing: 5) {
                                     Text(item.title).font(.headline).lineLimit(2)
-                                    Text(item.path).font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle).environment(\.layoutDirection, .leftToRight)
+                                    Text(item.path).font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle).environment(\.layoutDirection, .leftToRight)
                                     HStack(spacing: 8) {
                                         Text(URL(fileURLWithPath: item.path).pathExtension.isEmpty ? "קובץ" : URL(fileURLWithPath: item.path).pathExtension.uppercased())
                                             .font(.system(size: 9, weight: .bold, design: .rounded)).foregroundStyle(Palette.accent)
@@ -277,7 +275,7 @@ struct CloudView: View {
             }
             }
             HStack { Button("הקודם") { model.page -= 1 }.disabled(model.page == 0); Spacer(); Text("עמוד \(model.page+1) מתוך \(model.pageCount)").font(.caption).foregroundStyle(.secondary); Spacer(); Button("הבא") { model.page += 1 }.disabled(model.page+1 >= model.pageCount) }.buttonStyle(StudioButtonStyle())
-            HStack(alignment: .center, spacing: 12) {
+            ResponsiveRow(spacing: 12) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(model.selectionUpdating ? "מחשב בחירה…" : model.chosen.isEmpty ? "סמנו קבצים כדי להמשיך" : "\(model.chosen.count) קבצים נבחרו · \(size(model.amount)) משוער")
                         .font(.system(size: 12, weight: .semibold)).monospacedDigit()
@@ -285,14 +283,33 @@ struct CloudView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button(model.evict ? "הסר עותקים מהמק" : "העבר קובצי iCloud לפח") { model.confirm = true }.buttonStyle(StudioButtonStyle(prominent: true)).tint(model.evict ? Palette.accent : .red).disabled(model.chosen.isEmpty || model.busy || model.selectionUpdating || model.preparingAI)
+                Button(model.evict ? "סקירת הפינוי מהמק" : "סקירת ההעברה לפח") { model.confirm = true }.buttonStyle(StudioButtonStyle(prominent: true)).tint(model.evict ? Palette.accent : .red).disabled(model.chosen.isEmpty || model.busy || model.selectionUpdating || model.preparingAI)
             }
             .padding(10)
             .studioPanel(radius: 14, accented: !model.chosen.isEmpty)
             .animation(reduceMotion ? nil : .easeInOut(duration: 0.18), value: model.chosen.isEmpty)
-        }.frame(maxWidth: 1180, maxHeight: .infinity, alignment: .topLeading).padding(14).frame(maxWidth: .infinity, maxHeight: .infinity)
+        }.frame(maxWidth: 1180, maxHeight: .infinity, alignment: .topLeading).padding(20).frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(AmbientBackground())
         .onChange(of: protection.revision) { _ in model.protectionsChanged() }
+        .sheet(isPresented: $showSelectionTools) {
+            VStack(alignment: .leading, spacing: 18) {
+                HStack { Text("כלי בחירה").font(.title2.bold()); Spacer(); Button("סגור") { showSelectionTools = false } }
+                Text("בחרו קבצים לבדיקה. הפעולה עצמה תתבצע רק אחרי סקירה ואישור.").foregroundStyle(.secondary)
+                if model.evict {
+                    Button("בחירת כל העותקים הזמינים בתוצאות החיפוש") {
+                        model.selected.formUnion(model.visible.filter { $0.canEvict && !ProtectionStore.shared.isProtected($0.path) }.map(\.id))
+                        showSelectionTools = false
+                    }.disabled(model.busy || model.visible.isEmpty)
+                    Text("הבחירה כוללת את כל עמודי התוצאות, ורק עותקים מסונכרנים הזמינים להסרה מהמק.").font(.caption).foregroundStyle(.secondary)
+                }
+                Button("ניקוי הבחירה") { model.selected = []; showSelectionTools = false }
+                    .disabled(model.busy || model.selected.isEmpty)
+                Divider()
+                Button { showSelectionTools = false; model.openAI() } label: { Label("בחירה בעזרת AI", systemImage: "sparkles") }
+                    .disabled(model.busy || !model.scanned || model.preparingAI)
+            }.padding(24).buttonStyle(StudioButtonStyle())
+                .responsiveSheet(width: 570).preferredColorScheme(.dark).environment(\.layoutDirection, .rightToLeft)
+        }
         .sheet(isPresented: $showScanDetails) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
@@ -384,17 +401,22 @@ struct CloudView: View {
         let selected = model.evict == localOnly
         let color = localOnly ? Palette.accent : Color.orange
         return Button { withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.18)) { model.evict = localOnly } } label: {
-            HStack(spacing: 6) {
-                Image(systemName: icon)
-                Text(title)
-                Image(systemName: selected ? "checkmark.circle.fill" : "circle").font(.caption2).opacity(selected ? 1 : 0.3)
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: icon).font(.system(size: 18)).padding(.top, 2)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title).font(.system(size: 13, weight: .semibold))
+                    Text(localOnly ? "המקור נשאר ב־iCloud" : "ההסרה חלה בכל המכשירים")
+                        .font(.system(size: 11)).foregroundStyle(selected ? color.opacity(0.85) : Color.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+                Image(systemName: selected ? "checkmark.circle.fill" : "circle").font(.caption)
             }
-            .font(.system(size: 12, weight: .semibold))
             .foregroundStyle(selected ? color : Color.secondary)
-            .frame(maxWidth: .infinity).frame(height: 26)
-            .background(LinearGradient(colors: selected ? [color.opacity(0.19), Color.indigo.opacity(0.13)] : [Color.white.opacity(0.045), Color.indigo.opacity(0.045)], startPoint: .topLeading, endPoint: .bottomTrailing), in: RoundedRectangle(cornerRadius: 8))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(selected ? color.opacity(0.4) : Color.white.opacity(0.08), lineWidth: 1))
-            .contentShape(RoundedRectangle(cornerRadius: 8))
+            .padding(12).frame(maxWidth: .infinity, alignment: .leading)
+            .background(selected ? color.opacity(0.10) : Color.white.opacity(0.025), in: RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(selected ? color.opacity(0.45) : Color.white.opacity(0.09), lineWidth: 1))
+            .contentShape(RoundedRectangle(cornerRadius: 12))
         }.buttonStyle(.plain).studioHover(radius: 8).accessibilityAddTraits(selected ? .isSelected : [])
     }
 
