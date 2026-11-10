@@ -187,6 +187,7 @@ import Foundation
         let diskReport = diskEngine.scan(roots: [root], performance: .turbo, progress:{ diskProgress.append($0) }, batch: { _ in diskBatches += 1 })
         precondition(diskProgress.first?.directoryPercent == 0 && diskProgress.last?.directoryPercent == 100)
         precondition(diskProgress.allSatisfy { ($0.completedDirectories ?? -1) <= ($0.discoveredDirectories ?? -2) })
+        print("BENCHMARK disk fixture: \(diskReport.inspected) inspected, \(diskReport.workers) workers, \(String(format: "%.3f", diskReport.elapsed))s; no personal-disk speed guarantee")
         precondition(diskReport.files.isEmpty && diskReport.issues.isEmpty && !diskReport.cancelled && diskBatches == 0)
         precondition(tryResult { try database.stats().count == serial.files.count })
         var diskPaths: Set<String> = []

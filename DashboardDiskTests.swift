@@ -42,10 +42,10 @@ import Foundation
         precondition(!model.selectionLoading && model.chosen.isEmpty)
         try await Task.sleep(nanoseconds:100_000_000)
         precondition(model.chosenCount == 0 && model.chosenBytes == 0, "A stale selection result must not restore cleared files")
-        precondition(model.performance == .balanced)
+        precondition(model.performance == .turbo)
         let reopened = ExplorerModel(database:try InventoryDatabase(url:database.url))
         try await wait { reopened.inventoryCount == 100000 && !reopened.filtering }
         precondition(reopened.files.isEmpty && reopened.filtered.count <= 100)
-        print("PASS: 100000-row persistent inventory, only100 UI rows, lastpage/search/selection, reopen, balanced default; no file deletion")
+        print("PASS: 100000-row persistent inventory, only100 UI rows, lastpage/search/selection, reopen, maximum-speed default; no file deletion")
     }
 }

@@ -184,7 +184,27 @@ final class InventoryDatabase: @unchecked Sendable {
         return try work(handle)
     }
     private func resetLocked() throws {
-        try Self.execute(writer,"DELETE FROM files; DELETE FROM issues; DELETE FROM jobs; DELETE FROM scan_meta; DELETE FROM categories; UPDATE totals SET count=0,bytes=0,temporary_count=0,temporary_bytes=0 WHERE singleton=1;")
+        // The caller owns a write transaction. Bulk reset replaces all aggregates,
+        // so updating them for every deleted file/job wastes the scan startup time.
+        // Preserve exact trigger definitions; transactional DDL restores both schema
+        // and data if any delete or trigger recreation fails.
+        var deleteTriggers: [(String, String)] = []
+        do {
+            let statement = try Self.prepare(writer, "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND ((name='files_delete' AND tbl_name='files') OR (name='jobs_totals_delete' AND tbl_name='jobs')) ORDER BY name")
+            defer { sqlite3_finalize(statement) }
+            while true {
+                let result = sqlite3_step(statement)
+                if result == SQLITE_DONE { break }
+                guard result == SQLITE_ROW else { throw Failure.sqlite(String(cString: sqlite3_errmsg(writer))) }
+                deleteTriggers.append((Self.string(statement, 0), Self.string(statement, 1)))
+            }
+        }
+        guard deleteTriggers.count == 2, deleteTriggers.allSatisfy({ !$0.1.isEmpty }) else {
+            throw Failure.sqlite("missing inventory aggregate triggers")
+        }
+        try Self.execute(writer, "DROP TRIGGER files_delete; DROP TRIGGER jobs_totals_delete;")
+        try Self.execute(writer, "DELETE FROM files; DELETE FROM issues; DELETE FROM jobs; DELETE FROM scan_meta; DELETE FROM categories; UPDATE totals SET count=0,bytes=0,temporary_count=0,temporary_bytes=0 WHERE singleton=1; UPDATE job_totals SET discovered=0,completed=0 WHERE singleton=1;")
+        for (_, sql) in deleteTriggers { try Self.execute(writer, sql) }
     }
     func reset() throws { try transaction(inventoryChanged:true) { try resetLocked() } }
     func insert(file: DeepFile, snapshot: InventorySnapshot?) throws { try insertBatch([(file,snapshot)]) }
@@ -540,15 +560,34 @@ final class InventoryDatabase: @unchecked Sendable {
     // Keep queue ordering aligned with jobs_pending(state,directory). Ordering
     // by rowid forces SQLite to sort every pending directory for every claim.
     static let nextPendingJobSQL = "SELECT directory,root,record_first FROM jobs WHERE state=0 ORDER BY directory LIMIT 1"
-    func claimNextJob() throws -> InventoryJob? {
-        try transaction {
-            let statement = try Self.prepare(writer,Self.nextPendingJobSQL)
+    static let nextPendingJobsSQL = "SELECT directory,root,record_first FROM jobs WHERE state=0 ORDER BY directory LIMIT ?"
+    func claimNextJob() throws -> InventoryJob? { try claimNextJobs(limit: 1).first }
+    /// Claim a bounded worker-local queue in one transaction. Claimed jobs stay
+    /// active on disk until completed, so cancellation/crash replays every unused
+    /// job on resume without losing directory coverage.
+    func claimNextJobs(limit: Int = 32) throws -> [InventoryJob] {
+        guard limit > 0 else { return [] }
+        return try transaction {
+            let statement = try Self.prepare(writer, Self.nextPendingJobsSQL)
             defer { sqlite3_finalize(statement) }
-            guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
-            let job = InventoryJob(directory:URL(fileURLWithPath:Self.string(statement,0)),root:URL(fileURLWithPath:Self.string(statement,1)),recordFirst:sqlite3_column_int(statement,2) != 0)
-            let update = try Self.prepare(writer,"UPDATE jobs SET state=1 WHERE directory=? AND state<>2")
-            defer { sqlite3_finalize(update) }; try Self.bind([.text(job.directory.path)],to:update,db:writer); try Self.done(update,db:writer)
-            return job
+            try Self.bind([.integer(Int64(min(limit, 256)))], to: statement, db: writer)
+            var jobs: [InventoryJob] = []
+            jobs.reserveCapacity(min(limit, 256))
+            while true {
+                let result = sqlite3_step(statement)
+                if result == SQLITE_DONE { break }
+                guard result == SQLITE_ROW else { throw Failure.sqlite(String(cString: sqlite3_errmsg(writer))) }
+                jobs.append(InventoryJob(directory: URL(fileURLWithPath: Self.string(statement, 0)), root: URL(fileURLWithPath: Self.string(statement, 1)), recordFirst: sqlite3_column_int(statement, 2) != 0))
+            }
+            guard !jobs.isEmpty else { return [] }
+            let update = try Self.prepare(writer, "UPDATE jobs SET state=1 WHERE directory=? AND state=0")
+            defer { sqlite3_finalize(update) }
+            for job in jobs {
+                sqlite3_reset(update); sqlite3_clear_bindings(update)
+                try Self.bind([.text(job.directory.path)], to: update, db: writer)
+                try Self.done(update, db: writer)
+            }
+            return jobs
         }
     }
     /// Counts discovered directory jobs, not all directories on the computer.

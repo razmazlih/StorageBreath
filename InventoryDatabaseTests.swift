@@ -169,10 +169,37 @@ import SQLite3
         let reopened = try InventoryDatabase(url:url)
         try check(try reopened.stats().count == 19998)
         try check(try reopened.file(path:item(1).path)?.title == ".קובץ-מוסתר.txt")
+        // Failed bulk reset must roll back data and the temporarily suspended
+        // aggregate triggers. Successful reset restores them for later cleanup.
+        try db.insertBatch([(item(7), nil), (item(8), nil)])
+        try check(try db.stats().count == 20000)
+        var resetHandle: OpaquePointer?
+        precondition(sqlite3_open_v2(url.path, &resetHandle, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK)
+        defer { sqlite3_close(resetHandle) }
+        precondition(sqlite3_exec(resetHandle, "CREATE TRIGGER fail_reset_fixture BEFORE DELETE ON issues BEGIN SELECT RAISE(ABORT,'reset fixture failure'); END", nil, nil, nil) == SQLITE_OK)
+        do { try db.reset(); preconditionFailure("reset should roll back") } catch {}
+        try check(try db.stats().count == 20000 && db.stats().bytes == stats.bytes)
+        try check(try db.query(request: InventoryQuery()).total == 20000)
+        try check(try db.issueCount() == 1)
+        try db.remove(paths: [item(7).path])
+        try check(try db.stats().count == 19999 && db.stats().bytes == stats.bytes - 7)
+        try db.insert(file: item(7), snapshot: nil)
+        precondition(sqlite3_exec(resetHandle, "DROP TRIGGER fail_reset_fixture", nil, nil, nil) == SQLITE_OK)
         // Fresh initialization explicitly replaces cached data; resume preserves it.
         let roots = [folder]
+        let resetStarted = Date()
         _ = try db.beginScan(roots:roots,resume:false)
-        try check(try db.stats().count == 0)
+        print(String(format: "BENCHMARK reset 20000 files: %.4fs (local fixture wall time)", Date().timeIntervalSince(resetStarted)))
+        try check(try db.stats().count == 0 && db.stats().bytes == 0 && db.stats().temporaryCount == 0 && db.stats().temporaryBytes == 0 && db.stats().categories.isEmpty)
+        try check(try db.query(request: InventoryQuery()).total == 0)
+        try db.insert(file: item(2), snapshot: nil)
+        try check(try db.stats().count == 1 && db.stats().bytes == 2 && db.stats().temporaryCount == 1 && db.stats().temporaryBytes == 2 && db.stats().categories.count == 1)
+        try db.remove(paths: [item(2).path])
+        try check(try db.stats().count == 0 && db.stats().bytes == 0 && db.stats().temporaryCount == 0 && db.stats().categories.isEmpty)
+        try check(try db.directoryProgress() == (completed:0,discovered:1))
+        try db.enqueue([InventoryJob(directory: URL(fileURLWithPath: "/reset-delete-fixture"), root: folder, recordFirst: false)])
+        try check(try db.directoryProgress() == (completed:0,discovered:2))
+        precondition(sqlite3_exec(resetHandle, "DELETE FROM jobs WHERE directory='/reset-delete-fixture'", nil, nil, nil) == SQLITE_OK)
         try check(try db.directoryProgress() == (completed:0,discovered:1))
         let first = try db.claimNextJob()!
         precondition(first.directory == folder && first.recordFirst)
@@ -213,6 +240,14 @@ import SQLite3
         }
         precondition(details.contains { $0.contains("jobs_pending") })
         precondition(!details.contains { $0.contains("TEMP B-TREE") })
+        var batchPlan: OpaquePointer?
+        precondition(sqlite3_prepare_v2(handle, "EXPLAIN QUERY PLAN " + InventoryDatabase.nextPendingJobsSQL, -1, &batchPlan, nil) == SQLITE_OK)
+        defer { sqlite3_finalize(batchPlan) }
+        precondition(sqlite3_bind_int(batchPlan, 1, 32) == SQLITE_OK)
+        var batchDetails: [String] = []
+        while sqlite3_step(batchPlan) == SQLITE_ROW { batchDetails.append(String(cString: sqlite3_column_text(batchPlan, 3))) }
+        precondition(batchDetails.contains { $0.contains("jobs_pending") })
+        precondition(!batchDetails.contains { $0.contains("TEMP B-TREE") })
         let queued = (0..<1000).map { InventoryJob(directory: folder.appendingPathComponent(String(format: "ordered-%04d", $0)), root: folder, recordFirst: false) }
         try db.enqueue(Array(queued.reversed()))
         for (index, job) in queued.enumerated() where index.isMultiple(of: 3) { try db.finishJob(job.directory.path) }
@@ -236,6 +271,44 @@ import SQLite3
         precondition(replayedRoot.directory == folder)
         try reopened.finishJob(folder.path)
         try check(try db.directoryProgress() == (completed:2,discovered:2))
+        // Batched claims are disjoint across connections and durably active.
+        // Simulate abandoning most of a worker-local batch, then reopen/resume:
+        // every unfinished directory must return exactly once, completed work never.
+        let claimsURL = root.appendingPathComponent("claims.sqlite")
+        let claimsDB = try InventoryDatabase(url: claimsURL)
+        _ = try claimsDB.beginScan(roots: roots, resume: false)
+        let claimsRoot = try claimsDB.claimNextJob()!
+        try claimsDB.finishJob(claimsRoot.directory.path)
+        let claimJobs = (0..<70).map { InventoryJob(directory: folder.appendingPathComponent(String(format: "batch-%03d", $0)), root: folder, recordFirst: false) }
+        try claimsDB.enqueue(Array(claimJobs.reversed()))
+        try check(try claimsDB.claimNextJobs(limit: 0).isEmpty)
+        try check(try claimsDB.claimNextJobs(limit: -1).isEmpty)
+        let firstClaims = try claimsDB.claimNextJobs(limit: 32)
+        precondition(firstClaims.map(\.directory.path) == claimJobs.prefix(32).map(\.directory.path))
+        let claimsPeer = try InventoryDatabase(url: claimsURL)
+        let secondClaims = try claimsPeer.claimNextJobs(limit: 32)
+        precondition(secondClaims.map(\.directory.path) == claimJobs.dropFirst(32).prefix(32).map(\.directory.path))
+        precondition(Set(firstClaims.map(\.directory.path)).isDisjoint(with: secondClaims.map(\.directory.path)))
+        for job in firstClaims.prefix(3) { try claimsDB.finishJob(job.directory.path) }
+        try claimsDB.finishScan(cancelled: true)
+        let claimsReopened = try InventoryDatabase(url: claimsURL)
+        _ = try claimsReopened.beginScan(roots: roots, resume: true)
+        var replayedClaims: [String] = []
+        while true {
+            let batch = try claimsReopened.claimNextJobs(limit: 32)
+            if batch.isEmpty { break }
+            precondition(batch.count <= 32)
+            replayedClaims.append(contentsOf: batch.map(\.directory.path))
+            for job in batch { try claimsReopened.finishJob(job.directory.path) }
+        }
+        precondition(replayedClaims == claimJobs.dropFirst(3).map(\.directory.path))
+        precondition(Set(replayedClaims).count == replayedClaims.count)
+        try check(try claimsReopened.directoryProgress() == (completed: 71, discovered: 71))
+        // Keep even an extreme caller request bounded in memory.
+        let boundedJobs = (0..<300).map { InventoryJob(directory: folder.appendingPathComponent("bounded-\($0)"), root: folder, recordFirst: false) }
+        try claimsReopened.enqueue(boundedJobs)
+        try check(try claimsReopened.claimNextJobs(limit: Int.max).count == 256)
+
         // Upgrade an inventory created before counters existed. Bootstrap counts
         // its preexisting queue once, then reopen must preserve live totals.
         let legacyURL = root.appendingPathComponent("legacy-jobs.sqlite")

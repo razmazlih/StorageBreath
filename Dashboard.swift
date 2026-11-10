@@ -32,7 +32,7 @@ extension DeepFile {
     @Published var ai = false
     @Published var aiCandidates: [AICandidate] = []
     @Published var preparingAI = false
-    @Published var performance: ScanPerformance = .balanced
+    @Published var performance: ScanPerformance = .turbo
     @Published var lastWorkers = 0
     @Published var scanElapsed: TimeInterval = 0
     @Published private(set) var loadingIndex = false

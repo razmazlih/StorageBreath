@@ -84,6 +84,7 @@ final class DeepScanEngine {
         let callbackLock = NSLock()
         var work: [DirectoryWork] = []
         var active = 0
+        var diskJobs: [InventoryJob] = []
         var completedDirectories = 0
         var discoveredDirectories = 0
         var files: [DeepFile] = []
@@ -195,9 +196,13 @@ final class DeepScanEngine {
         values.fileResourceIdentifier.map { String(describing: values.volumeIdentifier) + ":" + String(describing: $0) }
     }
     private func owned(_ url: URL) -> Bool {
-        guard let attributes = try? fm.attributesOfItem(atPath: url.path),
-              let owner = attributes[.ownerAccountID] as? NSNumber else { return false }
-        return owner.uint32Value == getuid()
+        // Read only the ownership/type fields instead of allocating the full
+        // FileManager attribute dictionary for every candidate. lstat preserves
+        // the no-symlink rule; cleanup still revalidates fresh metadata.
+        var metadata = stat()
+        guard url.path.withCString({ lstat($0, &metadata) }) == 0,
+              (metadata.st_mode & S_IFMT) != S_IFLNK else { return false }
+        return metadata.st_uid == getuid()
     }
     private func allowed(_ url: URL, root: URL, verifyAncestors: Bool = true) -> Bool {
         let path = url.path
@@ -519,7 +524,12 @@ final class DeepScanEngine {
                     state.condition.lock()
                     var task: InventoryJob?
                     while !self.cancelled {
-                        do { task = try database.claimNextJob() }
+                        do {
+                            if state.diskJobs.isEmpty {
+                                state.diskJobs = try database.claimNextJobs(limit: 32).reversed()
+                            }
+                            task = state.diskJobs.popLast()
+                        }
                         catch { state.condition.unlock(); fail("", error); state.condition.lock(); break }
                         if task != nil || state.active == 0 { break }
                         state.condition.wait()
